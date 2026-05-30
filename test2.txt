@@ -1,0 +1,1238 @@
+# PIR Job Class — Separation of Concerns Redesign
+
+## Architecture
+
+The original `zcl_scm_pir_update` (700+ lines, 1 class) is split into **4 classes**, each with a single reason to change:
+
+```mermaid
+classDiagram
+    direction LR
+
+    class zcl_scm_pir_update {
+        <<Job Entry Point>>
+        -mv_pbookid
+        -mv_batchid
+        -mv_retry
+        -mv_mail
+        -mv_job_count
+        +get_parameters()
+        +execute()
+    }
+
+    class zcl_scm_pir_log {
+        <<Application Logging>>
+        -mo_log
+        -mo_log_db
+        +init()
+        +message()
+        +bapiret()
+        +save()
+    }
+
+    class zcl_scm_pir_dao {
+        <<Data Access>>
+        +fetch_staging_by_batch()
+        +fetch_staging_for_retry()
+        +fetch_pir_conditions()
+        +update_record_status()
+        +bulk_update_status()
+    }
+
+    class zcl_scm_pir_processor {
+        <<Business Logic>>
+        -mo_log
+        -mo_dao
+        +process_batch()
+        +process_retry()
+        -process_records()
+        -update_single_pir()
+        -check_active_retry_job()
+    }
+
+    zcl_scm_pir_update --> zcl_scm_pir_log : creates
+    zcl_scm_pir_update --> zcl_scm_pir_dao : creates
+    zcl_scm_pir_update --> zcl_scm_pir_processor : creates
+    zcl_scm_pir_processor --> zcl_scm_pir_log : uses
+    zcl_scm_pir_processor --> zcl_scm_pir_dao : uses
+```
+
+| Layer | Class | Responsibility | Reason to Change |
+|---|---|---|---|
+| **Entry Point** | `zcl_scm_pir_update` | APJ interfaces, parameter parsing, dependency wiring | Job template or routing logic changes |
+| **Logging** | `zcl_scm_pir_log` | BAL create / append / save | Logging infrastructure changes |
+| **Data Access** | `zcl_scm_pir_dao` | SQL reads + EML writes (staging & PIR) | Table/CDS schema changes |
+| **Business Logic** | `zcl_scm_pir_processor` | Validation, PIR update, batch/retry orchestration | Business rules change |
+
+---
+
+## Bugs Fixed
+
+> [!CAUTION]
+> ### 1. Missing `ENDIF` in `process_retry_batch` — Won't Compile
+> The `IF lv_tabix > 0` block is never closed. The final `ENDLOOP` tries to close the
+> outer `LOOP AT lt_staging` but the open `IF` block prevents compilation.
+> Status determination and EML update are inside the IF, so records with no matching PIR
+> skip the status update entirely — they remain as `cv_status_reinpro` forever.
+
+> [!CAUTION]
+> ### 2. `lv_all_ok` Overwrite — Currency Mismatch Silently Ignored
+> ```abap
+> IF <ls_pir>-currency <> <ls_stg>-currency.
+>   lv_all_ok = abap_false.    " ← set to FALSE on PIR #1
+>   CONTINUE.
+> ENDIF.
+> IF <ls_pir>-netpriceamount EQ <ls_stg>-netprice ...
+>   lv_all_ok = abap_true.     " ← OVERWRITTEN to TRUE on PIR #2!
+>   CONTINUE.
+> ENDIF.
+> ```
+> If a staging record matches 2 PIRs and PIR #1 has a currency mismatch but PIR #2
+> is already up to date, `lv_all_ok` ends as `abap_true` — hiding the error from PIR #1.
+> **Fix:** the "already up to date" path must NOT touch `lv_all_ok`.
+
+> [!WARNING]
+> ### 3. Missing `status` in Retry Error-Path `%control`
+> When no PIR is found during retry, the bulk-update sets `status = cv_status_error`
+> but `%control-status` is NOT set to `mk-on`. The status field is silently ignored
+> by the framework — records keep their old status.
+
+> [!WARNING]
+> ### 4. `save_log` Called 1000× Inside the Loop
+> In `process_batch`, `save_log( )` is called on every staging record iteration.
+> `save_log_2nd_db_connection` creates a DB commit per call — 1000 records = 1000
+> unnecessary DB round-trips. The log should be saved **once** after the loop.
+
+> [!NOTE]
+> ### 5. `lv_tabix` Shadowed in Retry Method
+> ```abap
+> LOOP AT lt_staging ASSIGNING FIELD-SYMBOL(<ls_stg>).
+>   lv_tabix = sy-tabix.                    " ← set to outer loop index
+>   ...
+>   lv_tabix = line_index( lt_pir[ ... ] ). " ← immediately overwritten
+> ```
+> The first assignment is wasted. Harmless but confusing. Removed in redesign.
+
+---
+
+## Class 1 — `zcl_scm_pir_log` (Application Logging)
+
+### Definition
+
+```abap
+*----------------------------------------------------------------------
+* Class:    ZCL_SCM_PIR_LOG
+* Purpose:  Encapsulates BAL (Business Application Log) operations.
+*           Creates, appends to, and persists a single application log.
+*
+* Usage:    Instantiate once per job run.  Call init() to start a new
+*           log session, message()/bapiret() to append entries, and
+*           save() to persist.  Safe to call message()/save() even if
+*           init() failed — the methods gracefully no-op.
+*----------------------------------------------------------------------
+CLASS zcl_scm_pir_log DEFINITION
+  PUBLIC
+  FINAL
+  CREATE PUBLIC.
+
+  PUBLIC SECTION.
+
+*----- Create a new BAL log instance for the given external ID.
+*----- All subsequent message / bapiret calls append to this log.
+*----- Uses BAL object ZSCM_FMKT_PIRLOG / subobject ZSCM_FMKT_SUBOBJ.
+    METHODS init
+      IMPORTING
+        iv_external_id TYPE balnrext.
+
+*----- Append a single T100 message to the current BAL log.
+    METHODS message
+      IMPORTING
+        iv_severity   TYPE symsgty DEFAULT if_bali_constants=>c_severity_status
+        iv_id         TYPE symsgid DEFAULT 'ZSCM_FAIRMARKIT'
+        iv_number     TYPE symsgno
+        iv_variable_1 TYPE symsgv OPTIONAL
+        iv_variable_2 TYPE symsgv OPTIONAL
+        iv_variable_3 TYPE symsgv OPTIONAL
+        iv_variable_4 TYPE symsgv OPTIONAL.
+
+*----- Append all entries from a BAPI return table to the BAL log.
+    METHODS bapiret
+      IMPORTING
+        it_messages TYPE bapirettab.
+
+*----- Persist the current BAL log to a 2nd DB connection and attach
+*----- it to the running APJ job for the Application Jobs Fiori app.
+    METHODS save.
+
+  PRIVATE SECTION.
+
+    DATA mo_log    TYPE REF TO if_bali_log.
+    DATA mo_log_db TYPE REF TO if_bali_log_db.
+
+ENDCLASS.
+```
+
+### Implementation
+
+```abap
+CLASS zcl_scm_pir_log IMPLEMENTATION.
+
+  METHOD init.
+    TRY.
+        DATA(lo_header) = cl_bali_header_setter=>create(
+          object      = 'ZSCM_FMKT_PIRLOG'
+          subobject   = 'ZSCM_FMKT_SUBOBJ'
+          external_id = iv_external_id ).
+
+        mo_log    = cl_bali_log=>create_with_header( header = lo_header ).
+        mo_log_db = cl_bali_log_db=>get_instance( ).
+
+      CATCH cx_bali_runtime INTO DATA(lx_bal).
+*----- Logging setup failure is non-critical for processing.
+        MESSAGE lx_bal->get_longtext( ) TYPE 'W'.
+    ENDTRY.
+  ENDMETHOD.
+
+
+  METHOD message.
+    IF mo_log IS NOT BOUND.
+      RETURN.
+    ENDIF.
+
+    TRY.
+        mo_log->add_item(
+          cl_bali_message_setter=>create(
+            severity   = iv_severity
+            id         = iv_id
+            number     = iv_number
+            variable_1 = iv_variable_1
+            variable_2 = iv_variable_2
+            variable_3 = iv_variable_3
+            variable_4 = iv_variable_4 ) ).
+      CATCH cx_bali_runtime.
+    ENDTRY.
+  ENDMETHOD.
+
+
+  METHOD bapiret.
+    IF mo_log IS NOT BOUND OR it_messages IS INITIAL.
+      RETURN.
+    ENDIF.
+
+    TRY.
+        mo_log->add_messages_from_bapirettab( message_table = it_messages ).
+      CATCH cx_bali_runtime.
+    ENDTRY.
+  ENDMETHOD.
+
+
+  METHOD save.
+    IF mo_log IS NOT BOUND OR mo_log_db IS NOT BOUND.
+      RETURN.
+    ENDIF.
+
+    TRY.
+        mo_log_db->save_log_2nd_db_connection( log = mo_log ).
+      CATCH cx_bali_runtime INTO DATA(lx_bal).
+        MESSAGE lx_bal->get_longtext( ) TYPE 'W'.
+    ENDTRY.
+  ENDMETHOD.
+
+ENDCLASS.
+```
+
+---
+
+## Class 2 — `zcl_scm_pir_dao` (Data Access Object)
+
+### Definition
+
+```abap
+*----------------------------------------------------------------------
+* Class:    ZCL_SCM_PIR_DAO
+* Purpose:  Encapsulates all database reads and writes for the PIR
+*           replication job.  This is the ONLY place that contains SQL
+*           SELECT statements and EML MODIFY/COMMIT calls.
+*
+*           Changing a CDS view, adding a field, or switching from EML
+*           to direct UPDATE only affects THIS class — the processor
+*           never touches the database directly.
+*----------------------------------------------------------------------
+CLASS zcl_scm_pir_dao DEFINITION
+  PUBLIC
+  FINAL
+  CREATE PUBLIC.
+
+  PUBLIC SECTION.
+
+*=======================================================================
+*  Shared Types — used by this class and by ZCL_SCM_PIR_PROCESSOR
+*=======================================================================
+
+*----- Staging record: one row from ZI_SCM_FMKT_PIRMODIFY.
+    TYPES: BEGIN OF ty_staging,
+             pricebookid          TYPE zi_scm_fmkt_pirmodify-pricebookid,
+             itemid               TYPE zi_scm_fmkt_pirmodify-itemid,
+             vendor               TYPE zi_scm_fmkt_pirmodify-vendor,
+             material             TYPE zi_scm_fmkt_pirmodify-material,
+             purchaseorganization TYPE zi_scm_fmkt_pirmodify-purchaseorganization,
+             priceunit            TYPE zi_scm_fmkt_pirmodify-priceunit,
+             netprice             TYPE zi_scm_fmkt_pirmodify-netprice,
+             currency             TYPE zi_scm_fmkt_pirmodify-currency,
+             status               TYPE zi_scm_fmkt_pirmodify-status,
+             numberofretries      TYPE zi_scm_fmkt_pirmodify-numberofretries,
+           END OF ty_staging.
+    TYPES tt_staging TYPE STANDARD TABLE OF ty_staging WITH EMPTY KEY.
+
+*----- PIR + Condition record: one row from the 3-way CDS JOIN.
+*----- This type MUST match the SELECT list in fetch_pir_conditions.
+*----- Fields from A_PURGINFORECDORGPLANTDATA are prefixed with "PIR org/plant".
+*----- Fields from A_PURINFORECDPRCGCNDN are the condition record fields
+*----- needed for CORRESPONDING # mapping into mmpur_inforecord-condition_amount.
+    TYPES: BEGIN OF ty_pir_cond,
+*---------- PIR org / plant data ---
+             purchasinginforecord         TYPE a_purginforecdorgplantdata-purchasinginforecord,
+             purchasinginforecordcategory TYPE a_purginforecdorgplantdata-purchasinginforecordcategory,
+             purchasingorganization       TYPE a_purginforecdorgplantdata-purchasingorganization,
+             plant                        TYPE a_purginforecdorgplantdata-plant,
+             currency                     TYPE a_purginforecdorgplantdata-currency,
+             materialpriceunitqty         TYPE a_purginforecdorgplantdata-materialpriceunitqty,
+             supplier                     TYPE a_purginforecdorgplantdata-supplier,
+             material                     TYPE a_purginforecdorgplantdata-material,
+             purchaseorderpriceunit       TYPE a_purginforecdorgplantdata-purchaseorderpriceunit,
+             netpriceamount               TYPE a_purginforecdorgplantdata-netpriceamount,
+             materialplanneddeliverydurn  TYPE a_purginforecdorgplantdata-materialplanneddeliverydurn,
+*---------- Condition record data ---
+             conditionrecord              TYPE a_purinforecdprcgcndn-conditionrecord,
+             conditionsequentialnumber    TYPE a_purinforecdprcgcndn-conditionsequentialnumber,
+             conditionapplication         TYPE a_purinforecdprcgcndn-conditionapplication,
+             conditiontype                TYPE a_purinforecdprcgcndn-conditiontype,
+             conditionvalidityenddate     TYPE a_purinforecdprcgcndn-conditionvalidityenddate,
+             conditionvaliditystartdate   TYPE a_purinforecdprcgcndn-conditionvaliditystartdate,
+             createdbyuser                TYPE a_purinforecdprcgcndn-createdbyuser,
+             creationdate                 TYPE a_purinforecdprcgcndn-creationdate,
+             conditiontextid              TYPE a_purinforecdprcgcndn-conditiontextid,
+             pricingscaletype             TYPE a_purinforecdprcgcndn-pricingscaletype,
+             pricingscalebasis            TYPE a_purinforecdprcgcndn-pricingscalebasis,
+             conditionscalequantity       TYPE a_purinforecdprcgcndn-conditionscalequantity,
+             conditionscalequantityunit   TYPE a_purinforecdprcgcndn-conditionscalequantityunit,
+             conditionscaleamount         TYPE a_purinforecdprcgcndn-conditionscaleamount,
+             conditionscaleamountcurrency TYPE a_purinforecdprcgcndn-conditionscaleamountcurrency,
+             conditioncalculationtype     TYPE a_purinforecdprcgcndn-conditioncalculationtype,
+             conditionratevalue           TYPE a_purinforecdprcgcndn-conditionratevalue,
+             conditionratevalueunit       TYPE a_purinforecdprcgcndn-conditionratevalueunit,
+             conditionrateratiounit       TYPE a_purinforecdprcgcndn-conditionrateratiounit,
+             conditionrateratio           TYPE a_purinforecdprcgcndn-conditionrateratio,
+             conditioncurrency            TYPE a_purinforecdprcgcndn-conditioncurrency,
+             conditionrateamount          TYPE a_purinforecdprcgcndn-conditionrateamount,
+             conditionquantity            TYPE a_purinforecdprcgcndn-conditionquantity,
+             conditionquantityunit        TYPE a_purinforecdprcgcndn-conditionquantityunit,
+             conditiontobaseqtynmrtr      TYPE a_purinforecdprcgcndn-conditiontobaseqtynmrtr,
+             conditiontobaseqtydnmntr     TYPE a_purinforecdprcgcndn-conditiontobaseqtydnmntr,
+             baseunit                     TYPE a_purinforecdprcgcndn-baseunit,
+             conditionlowerlimit          TYPE a_purinforecdprcgcndn-conditionlowerlimit,
+             conditionupperlimit          TYPE a_purinforecdprcgcndn-conditionupperlimit,
+             conditionalternativecurrency TYPE a_purinforecdprcgcndn-conditionalternativecurrency,
+             conditionexclusion           TYPE a_purinforecdprcgcndn-conditionexclusion,
+             conditionisdeleted           TYPE a_purinforecdprcgcndn-conditionisdeleted,
+             additionalvaluedays          TYPE a_purinforecdprcgcndn-additionalvaluedays,
+             fixedvaluedate               TYPE a_purinforecdprcgcndn-fixedvaluedate,
+             paymentterms                 TYPE a_purinforecdprcgcndn-paymentterms,
+             cndnmaxnumberofsalesorders   TYPE a_purinforecdprcgcndn-cndnmaxnumberofsalesorders,
+             minimumconditionbasisvalue   TYPE a_purinforecdprcgcndn-minimumconditionbasisvalue,
+             maximumconditionbasisvalue   TYPE a_purinforecdprcgcndn-maximumconditionbasisvalue,
+             maximumconditionamount       TYPE a_purinforecdprcgcndn-maximumconditionamount,
+             incrementalscale             TYPE a_purinforecdprcgcndn-incrementalscale,
+             pricingscaleline             TYPE a_purinforecdprcgcndn-pricingscaleline,
+             conditionreleasestatus       TYPE a_purinforecdprcgcndn-conditionreleasestatus,
+           END OF ty_pir_cond.
+    TYPES tt_pir_cond TYPE STANDARD TABLE OF ty_pir_cond WITH EMPTY KEY.
+
+*----- EML update structure alias — saves typing in callers.
+    TYPES tt_update TYPE TABLE FOR UPDATE zi_scm_fmkt_pirmodify.
+
+*=======================================================================
+*  Status constants — mirrors the job class for shared visibility.
+*=======================================================================
+    CONSTANTS cv_status_pending TYPE zscm_fmkt_status VALUE '1'.
+    CONSTANTS cv_status_reinpro TYPE zscm_fmkt_status VALUE '2'.
+    CONSTANTS cv_status_error   TYPE zscm_fmkt_status VALUE '3'.
+    CONSTANTS cv_status_success TYPE zscm_fmkt_status VALUE '4'.
+
+*=======================================================================
+*  Data Access Methods
+*=======================================================================
+
+*----- Fetch staging records for normal batch processing.
+*----- Returns records matching the given pricebook + batch UUID.
+    METHODS fetch_staging_by_batch
+      IMPORTING
+        iv_pbookid         TYPE zi_scm_fmkt_pirmodify-pricebookid
+        iv_batchid         TYPE zi_scm_fmkt_pirmodify-jobid
+      RETURNING
+        VALUE(rt_staging)  TYPE tt_staging.
+
+*----- Fetch staging records for retry processing.
+*----- iv_include_pending = TRUE  → status < cv_status_success (pending + error)
+*----- iv_include_pending = FALSE → status = cv_status_error only
+    METHODS fetch_staging_for_retry
+      IMPORTING
+        iv_include_pending TYPE abap_boolean DEFAULT abap_false
+      RETURNING
+        VALUE(rt_staging)  TYPE tt_staging.
+
+*----- Fetch PIR + PB00 condition records matching the staging data.
+*----- This is the SINGLE COPY of the 3-way CDS JOIN query used by
+*----- both batch and retry processing — no duplication.
+*----- Returned table is sorted by supplier + material + purchasingorganization.
+    METHODS fetch_pir_conditions
+      IMPORTING
+        it_staging        TYPE tt_staging
+      RETURNING
+        VALUE(rt_pir)     TYPE tt_pir_cond.
+
+*----- Update a single staging record's status via EML + COMMIT.
+*----- Called after each staging record is processed so that a dump
+*----- mid-loop leaves previously processed records with correct status.
+    METHODS update_record_status
+      IMPORTING
+        iv_pricebookid      TYPE zi_scm_fmkt_pirmodify-pricebookid
+        iv_itemid           TYPE zi_scm_fmkt_pirmodify-itemid
+        iv_status           TYPE zscm_fmkt_status
+        iv_job_count        TYPE btcjobcnt       OPTIONAL
+        iv_log_ext_id       TYPE balnrext         OPTIONAL
+        iv_number_of_retries TYPE zi_scm_fmkt_pirmodify-numberofretries OPTIONAL
+      RETURNING
+        VALUE(rv_success)   TYPE abap_boolean.
+
+*----- Bulk-update a set of staging records' statuses.
+*----- Used for one-shot operations like "mark all as reinpro".
+    METHODS bulk_update_status
+      IMPORTING
+        it_modifications TYPE tt_update
+      RETURNING
+        VALUE(rv_success) TYPE abap_boolean.
+
+ENDCLASS.
+```
+
+### Implementation
+
+```abap
+CLASS zcl_scm_pir_dao IMPLEMENTATION.
+
+
+  METHOD fetch_staging_by_batch.
+*-------------------------------------------------------------------
+*----- Fetch staging records for the given pricebook + batch UUID.
+*-------------------------------------------------------------------
+    SELECT pricebookid, itemid,
+           vendor, material, purchaseorganization,
+           priceunit, netprice, currency,
+           status, numberofretries
+      FROM zi_scm_fmkt_pirmodify
+      WHERE pricebookid = @iv_pbookid
+        AND jobid       = @iv_batchid
+      INTO CORRESPONDING FIELDS OF TABLE @rt_staging.
+  ENDMETHOD.
+
+
+  METHOD fetch_staging_for_retry.
+*-------------------------------------------------------------------
+*----- Fetch staging records eligible for retry.
+*----- If iv_include_pending = TRUE, also pick up orphaned records
+*----- (status 1 = pending) left by dead batch jobs.
+*-------------------------------------------------------------------
+    IF iv_include_pending = abap_true.
+      SELECT pricebookid, itemid,
+             vendor, material, purchaseorganization,
+             priceunit, netprice, currency,
+             status, numberofretries
+        FROM zi_scm_fmkt_pirmodify
+        WHERE numberofretries < 3
+          AND status          < @cv_status_success
+        INTO CORRESPONDING FIELDS OF TABLE @rt_staging.
+    ELSE.
+      SELECT pricebookid, itemid,
+             vendor, material, purchaseorganization,
+             priceunit, netprice, currency,
+             status, numberofretries
+        FROM zi_scm_fmkt_pirmodify
+        WHERE numberofretries < 3
+          AND status          = @cv_status_error
+        INTO CORRESPONDING FIELDS OF TABLE @rt_staging.
+    ENDIF.
+  ENDMETHOD.
+
+
+  METHOD fetch_pir_conditions.
+*-------------------------------------------------------------------
+*----- SINGLE COPY of the 3-way CDS JOIN query.
+*----- Called by both process_batch and process_retry — eliminates
+*----- the 60-line SQL duplication from the original class.
+*-----
+*----- Joins:
+*-----   a_purginforecdorgplantdata       (PIR org/plant)
+*-----   a_purinforecdprcgcndnvalidity    (condition validity)
+*-----   a_purinforecdprcgcndn            (condition record)
+*-----
+*----- Filters:
+*-----   - Supplier/Material/Org match staging records
+*-----   - Condition type = PB00
+*-----   - Condition validity covers today's date
+*-------------------------------------------------------------------
+    IF it_staging IS INITIAL.
+      RETURN.
+    ENDIF.
+
+    SELECT popd~purchasinginforecord,
+           popd~purchasinginforecordcategory,
+           popd~purchasingorganization,
+           popd~plant,
+           popd~currency,
+           popd~materialpriceunitqty,
+           popd~supplier,
+           popd~material,
+           popd~purchaseorderpriceunit,
+           popd~netpriceamount,
+           popd~materialplanneddeliverydurn,
+           ppcn~conditionrecord,
+           ppcn~conditionsequentialnumber,
+           ppcn~conditionapplication,
+           ppcn~conditiontype,
+           ppcn~conditionvalidityenddate,
+           ppcn~conditionvaliditystartdate,
+           ppcn~createdbyuser,
+           ppcn~creationdate,
+           ppcn~conditiontextid,
+           ppcn~pricingscaletype,
+           ppcn~pricingscalebasis,
+           ppcn~conditionscalequantity,
+           ppcn~conditionscalequantityunit,
+           ppcn~conditionscaleamount,
+           ppcn~conditionscaleamountcurrency,
+           ppcn~conditioncalculationtype,
+           ppcn~conditionratevalue,
+           ppcn~conditionratevalueunit,
+           ppcn~conditionrateratiounit,
+           ppcn~conditionrateratio,
+           ppcn~conditioncurrency,
+           ppcn~conditionrateamount,
+           ppcn~conditionquantity,
+           ppcn~conditionquantityunit,
+           ppcn~conditiontobaseqtynmrtr,
+           ppcn~conditiontobaseqtydnmntr,
+           ppcn~baseunit,
+           ppcn~conditionlowerlimit,
+           ppcn~conditionupperlimit,
+           ppcn~conditionalternativecurrency,
+           ppcn~conditionexclusion,
+           ppcn~conditionisdeleted,
+           ppcn~additionalvaluedays,
+           ppcn~fixedvaluedate,
+           ppcn~paymentterms,
+           ppcn~cndnmaxnumberofsalesorders,
+           ppcn~minimumconditionbasisvalue,
+           ppcn~maximumconditionbasisvalue,
+           ppcn~maximumconditionamount,
+           ppcn~incrementalscale,
+           ppcn~pricingscaleline,
+           ppcn~conditionreleasestatus
+      FROM a_purginforecdorgplantdata
+        WITH PRIVILEGED ACCESS AS popd
+      INNER JOIN a_purinforecdprcgcndnvalidity
+        WITH PRIVILEGED ACCESS AS ppcv
+        ON  popd~purchasinginforecord         = ppcv~purchasinginforecord
+        AND popd~purchasinginforecordcategory = ppcv~purchasinginforecordcategory
+        AND popd~purchasingorganization       = ppcv~purchasingorganization
+      INNER JOIN a_purinforecdprcgcndn
+        WITH PRIVILEGED ACCESS AS ppcn
+        ON  ppcv~conditionrecord = ppcn~conditionrecord
+      FOR ALL ENTRIES IN @it_staging
+      WHERE popd~supplier                     = @it_staging-vendor
+        AND popd~material                     = @it_staging-material
+        AND popd~purchasingorganization       = @it_staging-purchaseorganization
+        AND ppcv~purchasingorganization       = @it_staging-purchaseorganization
+        AND ppcv~conditionvalidityenddate    >= @sy-datum
+        AND ppcv~conditionvaliditystartdate  <= @sy-datum
+        AND ppcn~conditiontype                = 'PB00'
+      INTO CORRESPONDING FIELDS OF TABLE @rt_pir.
+
+*----- Sort for efficient LOOP AT ... FROM lv_tabix / EXIT pattern.
+    SORT rt_pir BY supplier material purchasingorganization.
+  ENDMETHOD.
+
+
+  METHOD update_record_status.
+*-------------------------------------------------------------------
+*----- Update a SINGLE staging record via EML + COMMIT.
+*----- Called per-record so that a dump mid-loop leaves previously
+*----- processed records with correct status in the DB.
+*-------------------------------------------------------------------
+    DATA(lt_mod) = VALUE tt_update(
+      ( %key-pricebookid = iv_pricebookid
+        %key-itemid      = iv_itemid
+        jobid            = iv_job_count
+        status           = iv_status
+        messagelognumber = iv_log_ext_id
+        numberofretries  = iv_number_of_retries
+        %control = VALUE #(
+          status           = if_abap_behv=>mk-on
+          jobid            = COND #( WHEN iv_job_count IS NOT INITIAL
+                                     THEN if_abap_behv=>mk-on
+                                     ELSE if_abap_behv=>mk-off )
+          messagelognumber = COND #( WHEN iv_log_ext_id IS NOT INITIAL
+                                     THEN if_abap_behv=>mk-on
+                                     ELSE if_abap_behv=>mk-off )
+          numberofretries  = COND #( WHEN iv_number_of_retries IS NOT INITIAL
+                                     THEN if_abap_behv=>mk-on
+                                     ELSE if_abap_behv=>mk-off ) ) ) ).
+
+    rv_success = bulk_update_status( lt_mod ).
+  ENDMETHOD.
+
+
+  METHOD bulk_update_status.
+*-------------------------------------------------------------------
+*----- Bulk-update staging record statuses via EML + COMMIT.
+*----- Goes through the RAP framework to handle locking correctly.
+*-------------------------------------------------------------------
+    rv_success = abap_true.
+
+    IF it_modifications IS INITIAL.
+      RETURN.
+    ENDIF.
+
+    DATA(lt_mod) = it_modifications.
+
+    MODIFY ENTITIES OF zi_scm_fmkt_pirmodify
+      ENTITY zi_scm_fmkt_pirmodify
+        UPDATE FIELDS ( status messagelognumber jobid numberofretries )
+        WITH lt_mod
+      FAILED   DATA(ls_failed)
+      REPORTED DATA(ls_reported).
+
+    COMMIT ENTITIES RESPONSE OF zi_scm_fmkt_pirmodify
+      FAILED   DATA(ls_failed_commit)
+      REPORTED DATA(ls_reported_commit).
+
+    IF ls_failed_commit IS NOT INITIAL.
+      rv_success = abap_false.
+    ENDIF.
+  ENDMETHOD.
+
+
+ENDCLASS.
+```
+
+---
+
+## Class 3 — `zcl_scm_pir_processor` (Business Logic)
+
+### Definition
+
+```abap
+*----------------------------------------------------------------------
+* Class:    ZCL_SCM_PIR_PROCESSOR
+* Purpose:  Contains ALL business logic for PIR replication.
+*           Receives log + DAO dependencies via constructor injection
+*           so it never touches the database or the logging API directly.
+*
+*           Two public entry points:
+*             process_batch()  — normal FairMarkit price batch
+*             process_retry()  — re-process previously failed records
+*
+*           Both delegate to the shared process_records() method,
+*           which is the SINGLE COPY of the match-validate-update loop.
+*----------------------------------------------------------------------
+CLASS zcl_scm_pir_processor DEFINITION
+  PUBLIC
+  FINAL
+  CREATE PUBLIC.
+
+  PUBLIC SECTION.
+
+*----- Constructor: inject dependencies (enables unit testing).
+    METHODS constructor
+      IMPORTING
+        io_log TYPE REF TO zcl_scm_pir_log
+        io_dao TYPE REF TO zcl_scm_pir_dao.
+
+*----- Process a normal FairMarkit price batch.
+    METHODS process_batch
+      IMPORTING
+        iv_pbookid   TYPE zi_scm_fmkt_pirmodify-pricebookid
+        iv_batchid   TYPE zi_scm_fmkt_pirmodify-jobid
+        iv_job_count TYPE btcjobcnt.
+
+*----- Re-process previously failed staging records.
+    METHODS process_retry
+      IMPORTING
+        iv_job_count TYPE btcjobcnt.
+
+  PRIVATE SECTION.
+
+*----- Injected dependencies.
+    DATA mo_log TYPE REF TO zcl_scm_pir_log.
+    DATA mo_dao TYPE REF TO zcl_scm_pir_dao.
+
+*----- Shared processing loop used by both batch and retry.
+*----- iv_is_retry controls whether numberofretries is incremented.
+    METHODS process_records
+      IMPORTING
+        it_staging     TYPE zcl_scm_pir_dao=>tt_staging
+        it_pir         TYPE zcl_scm_pir_dao=>tt_pir_cond
+        iv_job_count   TYPE btcjobcnt
+        iv_log_ext_id  TYPE balnrext
+        iv_is_retry    TYPE abap_boolean DEFAULT abap_false.
+
+*----- Update a single PIR via the MM Info Record Handler API.
+*----- The API commits internally — no explicit BAPI COMMIT needed.
+    METHODS update_single_pir
+      IMPORTING
+        is_pinfoupdate    TYPE mmpur_inforecord
+      RETURNING
+        VALUE(rv_success) TYPE abap_boolean.
+
+*----- Check whether an active retry job heartbeat exists within 5 min.
+*----- If not, orphaned pending records can be included in the retry.
+    METHODS check_active_retry_job
+      RETURNING
+        VALUE(rv_active) TYPE abap_boolean.
+
+ENDCLASS.
+```
+
+### Implementation
+
+```abap
+CLASS zcl_scm_pir_processor IMPLEMENTATION.
+
+
+  METHOD constructor.
+    mo_log = io_log.
+    mo_dao = io_dao.
+  ENDMETHOD.
+
+
+  METHOD process_batch.
+*-------------------------------------------------------------------
+*----- Batch processing orchestration:
+*-----   1. Init log
+*-----   2. Fetch staging records by pricebook + batch UUID
+*-----   3. Fetch matching PIR + PB00 condition records
+*-----   4. Process each record (shared loop)
+*-----   5. Save log
+*-------------------------------------------------------------------
+
+*----- Build external ID for the batch log (fits BALNREXT CHAR 22).
+    DATA(lv_log_ext_id) = CONV balnrext(
+      |{ iv_pbookid(12) }_{ sy-uzeit }| ).
+
+    mo_log->init( lv_log_ext_id ).
+
+*----- 1. Fetch staging records for this batch.
+    DATA(lt_staging) = mo_dao->fetch_staging_by_batch(
+      iv_pbookid = iv_pbookid
+      iv_batchid = iv_batchid ).
+
+    IF lt_staging IS INITIAL.
+      mo_log->message( iv_severity = if_bali_constants=>c_severity_information
+                       iv_number   = 002 ).
+      mo_log->save( ).
+      RETURN.
+    ENDIF.
+
+*----- 2. Fetch matching PIR + condition records.
+    DATA(lt_pir) = mo_dao->fetch_pir_conditions( lt_staging ).
+
+    IF lt_pir IS INITIAL.
+*----- No PIR records found for the entire batch — mark all as error.
+      mo_log->message( iv_severity = if_bali_constants=>c_severity_error
+                       iv_number   = 002 ).
+
+      LOOP AT lt_staging ASSIGNING FIELD-SYMBOL(<ls_stg_err>).
+        mo_dao->update_record_status(
+          iv_pricebookid = <ls_stg_err>-pricebookid
+          iv_itemid      = <ls_stg_err>-itemid
+          iv_status      = zcl_scm_pir_dao=>cv_status_error
+          iv_job_count   = iv_job_count
+          iv_log_ext_id  = lv_log_ext_id ).
+      ENDLOOP.
+
+      mo_log->save( ).
+      RETURN.
+    ENDIF.
+
+*----- 3. Process each staging record against PIR records.
+    process_records(
+      it_staging    = lt_staging
+      it_pir        = lt_pir
+      iv_job_count  = iv_job_count
+      iv_log_ext_id = lv_log_ext_id
+      iv_is_retry   = abap_false ).
+
+*----- 4. Save the batch log (once, after the loop).
+    mo_log->save( ).
+  ENDMETHOD.
+
+
+  METHOD process_retry.
+*-------------------------------------------------------------------
+*----- Retry processing orchestration:
+*-----   1. Check for active retry job heartbeat
+*-----   2. Fetch eligible records (error only, or error + pending)
+*-----   3. Mark all selected records as "retry in progress"
+*-----   4. Fetch matching PIR + condition records
+*-----   5. Process each record (shared loop)
+*-----   6. Save log
+*-------------------------------------------------------------------
+
+*----- 1. Check if another retry job is active (heartbeat within 5 min).
+    DATA(lv_include_pending) = COND abap_boolean(
+      WHEN check_active_retry_job( ) = abap_true  THEN abap_false
+      ELSE                                             abap_true ).
+
+    DATA(lv_log_ext_id) = CONV balnrext(
+      |RETRY:{ iv_job_count }_{ sy-datum }{ sy-uzeit }| ).
+
+    mo_log->init( lv_log_ext_id ).
+
+*----- 2. Fetch records eligible for retry.
+    DATA(lt_staging) = mo_dao->fetch_staging_for_retry(
+      iv_include_pending = lv_include_pending ).
+
+    IF lt_staging IS INITIAL.
+      mo_log->message( iv_severity = if_bali_constants=>c_severity_status
+                       iv_number   = 010 ).
+      mo_log->save( ).
+      RETURN.
+    ENDIF.
+
+*----- 3. Mark all selected records as "retry in progress" (heartbeat).
+    DATA(lt_reinpro) = VALUE zcl_scm_pir_dao=>tt_update(
+      FOR <ls_rip> IN lt_staging
+      ( %key-pricebookid = <ls_rip>-pricebookid
+        %key-itemid      = <ls_rip>-itemid
+        jobid            = iv_job_count
+        status           = zcl_scm_pir_dao=>cv_status_reinpro
+        messagelognumber = lv_log_ext_id
+        %control = VALUE #(
+          jobid            = if_abap_behv=>mk-on
+          status           = if_abap_behv=>mk-on
+          messagelognumber = if_abap_behv=>mk-on ) ) ).
+    mo_dao->bulk_update_status( lt_reinpro ).
+
+*----- 4. Fetch matching PIR + condition records.
+    DATA(lt_pir) = mo_dao->fetch_pir_conditions( lt_staging ).
+
+    IF lt_pir IS INITIAL.
+      mo_log->message( iv_severity = if_bali_constants=>c_severity_error
+                       iv_number   = 002 ).
+*----- Mark all as error (with retry counter incremented).
+      LOOP AT lt_staging ASSIGNING FIELD-SYMBOL(<ls_stg_err>).
+        mo_dao->update_record_status(
+          iv_pricebookid       = <ls_stg_err>-pricebookid
+          iv_itemid            = <ls_stg_err>-itemid
+          iv_status            = zcl_scm_pir_dao=>cv_status_error
+          iv_number_of_retries = <ls_stg_err>-numberofretries + 1 ).
+      ENDLOOP.
+
+      mo_log->save( ).
+      RETURN.
+    ENDIF.
+
+*----- 5. Process each staging record against PIR records.
+    process_records(
+      it_staging    = lt_staging
+      it_pir        = lt_pir
+      iv_job_count  = iv_job_count
+      iv_log_ext_id = lv_log_ext_id
+      iv_is_retry   = abap_true ).
+
+*----- 6. Save the retry log (once, after the loop).
+    mo_log->save( ).
+  ENDMETHOD.
+
+
+  METHOD process_records.
+*-------------------------------------------------------------------
+*----- SHARED PROCESSING LOOP used by both batch and retry.
+*----- This is the SINGLE COPY of the match → validate → update logic.
+*-----
+*----- For each staging record:
+*-----   a. Log record identification (pricebook + item)
+*-----   b. Find matching PIRs via sorted-table index lookup
+*-----   c. Validate currency compatibility
+*-----   d. Skip if price already up to date
+*-----   e. Update PIR via MM API
+*-----   f. Determine final status and update staging record
+*-------------------------------------------------------------------
+    LOOP AT it_staging ASSIGNING FIELD-SYMBOL(<ls_stg>).
+
+*----- Log record identification for tracing.
+      mo_log->message(
+        iv_severity   = if_bali_constants=>c_severity_warning
+        iv_number     = 007
+        iv_variable_1 = CONV #( <ls_stg>-pricebookid )
+        iv_variable_2 = CONV #( <ls_stg>-itemid ) ).
+
+      DATA(lv_pir_found) = abap_false.
+      DATA(lv_all_ok)    = abap_true.
+
+*----- Find first matching PIR using sorted-table index lookup.
+      DATA(lv_tabix) = line_index(
+        it_pir[ supplier               = <ls_stg>-vendor
+                material               = <ls_stg>-material
+                purchasingorganization = <ls_stg>-purchaseorganization ] ).
+
+      IF lv_tabix > 0.
+*----- Inner loop: process all PIRs matching this staging record.
+*----- Since it_pir is sorted, we start from lv_tabix and EXIT when
+*----- the combination changes — no need to scan the full table.
+        LOOP AT it_pir ASSIGNING FIELD-SYMBOL(<ls_pir>)
+          FROM lv_tabix.
+
+          IF    <ls_pir>-supplier               <> <ls_stg>-vendor
+            OR  <ls_pir>-material               <> <ls_stg>-material
+            OR  <ls_pir>-purchasingorganization <> <ls_stg>-purchaseorganization.
+            EXIT.
+          ENDIF.
+
+          lv_pir_found = abap_true.
+
+*-------- Validate: currency must match S/4 ↔ FairMarkit.
+          IF <ls_pir>-currency <> <ls_stg>-currency.
+            mo_log->message(
+              iv_severity   = if_bali_constants=>c_severity_error
+              iv_number     = 005
+              iv_variable_1 = CONV #( <ls_pir>-currency )
+              iv_variable_2 = CONV #( <ls_stg>-currency ) ).
+            lv_all_ok = abap_false.
+            CONTINUE.
+          ENDIF.
+
+*-------- Skip if price + price unit already up to date.
+*-------- BUG FIX: do NOT set lv_all_ok = abap_true here — that would
+*-------- overwrite a previous abap_false from a currency mismatch
+*-------- on a different PIR for the same staging record.
+          IF  <ls_pir>-netpriceamount     EQ <ls_stg>-netprice
+          AND <ls_pir>-materialpriceunitqty EQ <ls_stg>-priceunit.
+            mo_log->message(
+              iv_severity   = if_bali_constants=>c_severity_status
+              iv_number     = 008
+              iv_variable_1 = CONV #( <ls_pir>-purchasinginforecord ) ).
+            CONTINUE.  " ← no lv_all_ok change — correct!
+          ENDIF.
+
+*-------- Build update payload and call the MM API.
+*-------- Inject FairMarkit net price into the condition rate fields.
+          DATA(ls_pir_copy) = <ls_pir>.
+          ls_pir_copy-conditionratevalue  = <ls_stg>-netprice.
+          ls_pir_copy-conditionrateamount = <ls_stg>-netprice.
+
+          DATA(lv_ok) = update_single_pir(
+            is_pinfoupdate = VALUE #(
+              general_data-data-purchasinginforecord = ls_pir_copy-purchasinginforecord
+              purchasing_org_data = VALUE #( (
+                data = VALUE #(
+                  purchasinginforecord         = ls_pir_copy-purchasinginforecord
+                  purchasinginforecordcategory = ls_pir_copy-purchasinginforecordcategory
+                  purchasingorganization       = ls_pir_copy-purchasingorganization
+                  plant                        = ls_pir_copy-plant
+                  materialpriceunitqty         = ls_pir_copy-materialpriceunitqty
+                  purchaseorderpriceunit       = ls_pir_copy-purchaseorderpriceunit )
+                datax = VALUE #(
+                  purchasinginforecord         = abap_true
+                  purchasinginforecordcategory = abap_true
+                  purchasingorganization       = abap_true
+                  plant                        = abap_true
+                  materialpriceunitqty         = abap_true
+                  purchaseorderpriceunit       = abap_true )
+                condition_amount = VALUE #( ( CORRESPONDING #( ls_pir_copy ) ) )
+              ) ) ) ).
+
+          IF lv_ok = abap_false.
+            lv_all_ok = abap_false.
+          ENDIF.
+
+        ENDLOOP.  " inner loop: PIR records
+      ENDIF.      " lv_tabix > 0
+
+*-------- Determine final status for this staging record.
+      DATA(lv_status) = COND zscm_fmkt_status(
+        WHEN ( lv_pir_found = abap_false OR lv_all_ok = abap_false )
+        THEN zcl_scm_pir_dao=>cv_status_error
+        ELSE zcl_scm_pir_dao=>cv_status_success ).
+
+*----- Log if no PIR was found.
+      IF lv_pir_found = abap_false.
+        mo_log->message(
+          iv_severity   = if_bali_constants=>c_severity_error
+          iv_number     = 006
+          iv_variable_1 = CONV #( |Supplier:{ <ls_stg>-vendor }| )
+          iv_variable_2 = CONV #( |Material:{ <ls_stg>-material }| )
+          iv_variable_3 = CONV #( |Pur. Org:{ <ls_stg>-purchaseorganization }| ) ).
+      ENDIF.
+
+*----- Immediately update THIS record's status.
+      IF iv_is_retry = abap_true.
+*----- Retry: also increment the retry counter.
+        mo_dao->update_record_status(
+          iv_pricebookid       = <ls_stg>-pricebookid
+          iv_itemid            = <ls_stg>-itemid
+          iv_status            = lv_status
+          iv_number_of_retries = <ls_stg>-numberofretries + 1 ).
+      ELSE.
+*----- Normal batch: set job count + log external ID.
+        mo_dao->update_record_status(
+          iv_pricebookid = <ls_stg>-pricebookid
+          iv_itemid      = <ls_stg>-itemid
+          iv_status      = lv_status
+          iv_job_count   = iv_job_count
+          iv_log_ext_id  = lv_log_ext_id ).
+      ENDIF.
+
+    ENDLOOP.  " outer loop: staging records
+  ENDMETHOD.
+
+
+  METHOD update_single_pir.
+*-------------------------------------------------------------------
+*----- Update a single PIR via the MM Info Record Handler API.
+*----- The API commits internally — no explicit BAPI COMMIT needed.
+*-------------------------------------------------------------------
+    DATA(lo_handler) = cl_mm_pur_info_record_handler=>create( ).
+
+    lo_handler->if_mm_pur_info_record_handler~process(
+      EXPORTING
+        is_inforecord = is_pinfoupdate
+        iv_info_upd   = 'X'
+        iv_cprog      = 'ODATA_API'
+      IMPORTING
+        ev_error      = DATA(lv_error)
+        et_messages   = DATA(lt_messages) ).
+
+*----- Remove warnings from the message table before logging.
+    DELETE lt_messages WHERE type = 'W'.
+
+    IF lt_messages IS NOT INITIAL.
+*----- Error/info messages returned — log them.
+      mo_log->bapiret( lt_messages ).
+    ELSE.
+*----- No error/info messages and no error flag → log success.
+      IF lv_error IS INITIAL.
+        mo_log->message(
+          iv_number     = 009
+          iv_variable_3 = CONV #(
+            is_pinfoupdate-general_data-data-purchasinginforecord ) ).
+      ENDIF.
+    ENDIF.
+
+    rv_success = COND #( WHEN lv_error IS INITIAL
+                         THEN abap_true
+                         ELSE abap_false ).
+  ENDMETHOD.
+
+
+  METHOD check_active_retry_job.
+*-------------------------------------------------------------------
+*----- Check whether an active retry job heartbeat exists within
+*----- a 5-minute window.  If no heartbeat is found, orphaned
+*----- pending records (left by dead batch jobs) can be retried.
+*-------------------------------------------------------------------
+    rv_active = abap_false.
+
+    TRY.
+        DATA lv_now TYPE abp_lastchange_tstmpl.
+        CONVERT DATE sy-datum TIME sy-uzeit
+          INTO TIME STAMP lv_now TIME ZONE sy-zonlo.
+
+*----- Subtract 5 minutes from the current timestamp.
+        DATA(lv_cutoff) = cl_abap_tstmp=>subtractsecs(
+          tstmp = lv_now
+          secs  = 300 ).
+
+*----- Look for heartbeat records updated within the 5-minute window.
+        SELECT SINGLE @abap_true
+          FROM zi_scm_fmkt_rjobs_pot
+          WHERE lastchangedatetime LE @lv_now
+            AND lastchangedatetime GE @lv_cutoff
+          INTO @rv_active.
+
+      CATCH cx_parameter_invalid_range
+            cx_parameter_invalid_type.
+*----- Timestamp arithmetic failed — assume no active job.
+        rv_active = abap_false.
+    ENDTRY.
+  ENDMETHOD.
+
+
+ENDCLASS.
+```
+
+---
+
+## Class 4 — `zcl_scm_pir_update` (Job Entry Point)
+
+### Definition + Implementation
+
+```abap
+*----------------------------------------------------------------------
+* Class:    ZCL_SCM_PIR_UPDATE
+* Purpose:  Thin APJ job entry point.  Responsible ONLY for:
+*             - Declaring job template parameters
+*             - Parsing runtime parameter values
+*             - Resolving the background job count
+*             - Wiring dependencies and routing to the correct scenario
+*
+*           All business logic, data access, and logging are delegated
+*           to zcl_scm_pir_processor, zcl_scm_pir_dao, and zcl_scm_pir_log.
+*----------------------------------------------------------------------
+CLASS zcl_scm_pir_update DEFINITION
+  PUBLIC
+  FINAL
+  CREATE PUBLIC.
+
+  PUBLIC SECTION.
+
+    INTERFACES if_apj_dt_exec_object.
+    INTERFACES if_apj_rt_exec_object.
+
+  PRIVATE SECTION.
+
+*----- APJ parameter selection names (must match job template).
+    CONSTANTS cv_param_pbookid  TYPE if_apj_dt_exec_object=>ty_templ_def-selname VALUE 'P_PBID'.
+    CONSTANTS cv_param_batchid  TYPE if_apj_dt_exec_object=>ty_templ_def-selname VALUE 'P_JBID'.
+    CONSTANTS cv_param_retry    TYPE if_apj_dt_exec_object=>ty_templ_def-selname VALUE 'P_RETRY'.
+    CONSTANTS cv_param_mailtrig TYPE if_apj_dt_exec_object=>ty_templ_def-selname VALUE 'P_MTRIG'.
+
+*----- Parsed job parameters.
+    DATA mv_pbookid   TYPE zi_scm_fmkt_pirmodify-pricebookid.
+    DATA mv_batchid   TYPE zi_scm_fmkt_pirmodify-jobid.
+    DATA mv_retry     TYPE abap_boolean.
+    DATA mv_mail      TYPE abap_boolean.
+    DATA mv_job_count TYPE btcjobcnt.
+
+*----- Parse APJ parameter table into typed instance variables.
+    METHODS fill_selection_param
+      IMPORTING
+        it_parameters TYPE if_apj_dt_exec_object=>tt_templ_val.
+
+*----- Resolve the current background job's count number.
+    METHODS resolve_job_count.
+
+ENDCLASS.
+
+
+CLASS zcl_scm_pir_update IMPLEMENTATION.
+
+
+  METHOD if_apj_dt_exec_object~get_parameters.
+    CONSTANTS:
+      cv_de_pbookid  TYPE if_apj_dt_exec_object=>ty_templ_def-component_type VALUE 'ZSCM_FMKT_PBOOKID',
+      cv_de_batchid  TYPE if_apj_dt_exec_object=>ty_templ_def-component_type VALUE 'ZSCM_FMKT_JOBID',
+      cv_de_retry    TYPE if_apj_dt_exec_object=>ty_templ_def-component_type VALUE 'ZSCM_FMKT_RETRY',
+      cv_de_mailtrig TYPE if_apj_dt_exec_object=>ty_templ_def-component_type VALUE 'ZSCM_FMKT_MTRIGGER'.
+
+    et_parameter_def = VALUE #(
+      ( selname = cv_param_pbookid  kind = if_apj_dt_exec_object=>parameter
+        component_type = cv_de_pbookid   param_text = TEXT-001
+        changeable_ind = abap_true  mandatory_ind = abap_false
+        datatype = 'C'  length = 32 )
+      ( selname = cv_param_batchid  kind = if_apj_dt_exec_object=>parameter
+        component_type = cv_de_batchid   param_text = TEXT-002
+        changeable_ind = abap_true  mandatory_ind = abap_false
+        datatype = 'X'  length = 16 )
+      ( selname = cv_param_retry    kind = if_apj_dt_exec_object=>parameter
+        component_type = cv_de_retry     param_text = TEXT-003
+        changeable_ind = abap_true  mandatory_ind = abap_false
+        datatype = 'C'  length = 1 )
+      ( selname = cv_param_mailtrig kind = if_apj_dt_exec_object=>parameter
+        component_type = cv_de_mailtrig  param_text = TEXT-004
+        changeable_ind = abap_true  mandatory_ind = abap_false
+        datatype = 'C'  length = 1 ) ).
+  ENDMETHOD.
+
+
+  METHOD if_apj_rt_exec_object~execute.
+*-------------------------------------------------------------------
+*----- Entry point.  Wire dependencies and route to scenario.
+*-------------------------------------------------------------------
+    resolve_job_count( ).
+    fill_selection_param( it_parameters ).
+
+*----- Create the three service objects (constructor injection).
+    DATA(lo_log) = NEW zcl_scm_pir_log( ).
+    DATA(lo_dao) = NEW zcl_scm_pir_dao( ).
+    DATA(lo_processor) = NEW zcl_scm_pir_processor(
+      io_log = lo_log
+      io_dao = lo_dao ).
+
+*----- Route to the correct processing scenario.
+    IF mv_pbookid IS NOT INITIAL AND mv_batchid IS NOT INITIAL.
+      lo_processor->process_batch(
+        iv_pbookid   = mv_pbookid
+        iv_batchid   = mv_batchid
+        iv_job_count = mv_job_count ).
+
+    ELSEIF mv_retry = abap_true.
+      lo_processor->process_retry(
+        iv_job_count = mv_job_count ).
+
+    ELSEIF mv_mail = abap_true.
+*----- TODO: Trigger summary/notification email.
+    ENDIF.
+  ENDMETHOD.
+
+
+  METHOD fill_selection_param.
+    IF it_parameters IS INITIAL.
+      RETURN.
+    ENDIF.
+    mv_pbookid = VALUE #( it_parameters[ selname = cv_param_pbookid  ]-low OPTIONAL ).
+    mv_batchid = VALUE #( it_parameters[ selname = cv_param_batchid  ]-low OPTIONAL ).
+    mv_retry   = VALUE #( it_parameters[ selname = cv_param_retry    ]-low OPTIONAL ).
+    mv_mail    = VALUE #( it_parameters[ selname = cv_param_mailtrig ]-low OPTIONAL ).
+  ENDMETHOD.
+
+
+  METHOD resolve_job_count.
+    CALL FUNCTION 'GET_JOB_RUNTIME_INFO'
+      IMPORTING
+        jobcount = mv_job_count
+      EXCEPTIONS
+        OTHERS   = 99.
+    IF sy-subrc <> 0.
+      CLEAR mv_job_count.
+    ENDIF.
+  ENDMETHOD.
+
+
+ENDCLASS.
+```
+
+---
+
+## Improvement Summary
+
+| Concern | Before (1 Class) | After (4 Classes) |
+|---|---|---|
+| **SQL duplication** | 60-line PIR query copy-pasted in `process_batch` + `process_retry_batch` | Single `fetch_pir_conditions` in DAO |
+| **Loop duplication** | Match/validate/update loop copy-pasted in both methods | Single `process_records` in Processor |
+| **Logging** | 4 methods mixed into the job class | Separate `zcl_scm_pir_log` |
+| **Data access** | SELECTs + EML scattered in 3 methods | Separate `zcl_scm_pir_dao` |
+| **Testability** | Untestable monolith | Constructor injection; can mock log + DAO |
+| **Job class size** | 700+ lines | ~80 lines (thin routing layer) |
+| **`save_log` calls** | 1000× (inside loop) | 1× (after loop) |
+| **`lv_all_ok` bug** | "Up to date" overwrites earlier failure | "Up to date" does not touch flag |
+| **Retry compile error** | Missing ENDIF | Fixed in shared `process_records` |
+| **Retry `%control-status`** | Missing `mk-on` for status | Fixed in `update_record_status` |
+
+### How Each Class Passes the "Single Reason to Change" Test
+
+| Class | What Would Trigger a Change | What Would NOT |
+|---|---|---|
+| `zcl_scm_pir_update` | Job template parameters, routing logic | SQL schema, PIR API, logging format |
+| `zcl_scm_pir_log` | BAL API changes, log object/subobject | Business rules, CDS views |
+| `zcl_scm_pir_dao` | CDS view schema, EML target BO, staging table | Validation logic, PIR API |
+| `zcl_scm_pir_processor` | Business rules (validation, retry logic) | How SQL runs, how logs are stored |
